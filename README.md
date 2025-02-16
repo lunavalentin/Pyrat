@@ -30,9 +30,6 @@ pip install -r requirements.txt
 ## 📝 Usage
 Here’s a quick example of how to load an impulse response and compute its reverberation time:
 
-python
-Copier
-Modifier
 import pyrat2 as pr
 
 ### Load an impulse response
