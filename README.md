@@ -27,21 +27,6 @@ git clone https://github.com/lunavalentin/pyrat2.git
 cd pyrat2
 pip install -r requirements.txt
 
-## 📝 Usage
-Here’s a quick example of how to load an impulse response and compute its reverberation time:
-
-import pyrat2 as pr
-
-### Load an impulse response
-rir = pr.load_rir("example_rir.wav")
-
-### Compute reverberation time
-t30 = pr.compute_reverberation_time(rir, method="T30")
-print(f"Reverberation Time (T30): {t30} seconds")
-
-### Visualize the impulse response
-pr.plot_rir(rir)
-
 ## 🛠️ Acknowledgments
 Developed as part of room acoustics research at Stanford CCRMA.
 Developped in contribution with Sara MArtin and Peter Svensson (NTNU), & Jonathan Able (CCRMA)

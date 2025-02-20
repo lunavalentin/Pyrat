@@ -298,7 +298,7 @@ def split_and_save_channels(input_wav, output_folder):
         sf.write(output_file_path, channel_data, fs, format='wav', subtype='PCM_32')
         print(f"Saved: {output_file_path}")
 
-def normd_sweep_to_ir(wav_file, orig_sweep, duration, output_folder):
+def normd_sweep_to_ir(wav_file, orig_sweep, duration, output_folder, temp):
     """
     Process a single WAV file to generate an impulse response (IR), 
     normalized according to a reference sweep signal.
@@ -383,23 +383,32 @@ def normd_sweep_to_ir(wav_file, orig_sweep, duration, output_folder):
     print("Computed scalefactor =", scalefactor)
 
     ir_normalized = ir_cropped / scalefactor
+    # Prepare output paths
+    base_file_name, _ = os.path.splitext(os.path.basename(wav_file))
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
 
     # --- Ensure output folder exists ---
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
         print(f"Created output folder: {output_folder}")
 
-    # --- 7) Write the IR to a WAV file ---
-    base_file_name, _ = os.path.splitext(os.path.basename(wav_file))
-    scalefactor_str = f"{scalefactor:.8f}"
-    output_file_path = os.path.join(
-        output_folder, f"IR_n_{base_file_name}_sf{scalefactor_str}.wav"
-    )
+    # --- Write the IR to a WAV file ---
+    scalefactor_str = f'{scalefactor:.8f}'
+    output_file_path = os.path.join(temp, f'IR_nsc_{base_file_name}.wav')
+    final = os.path.join(output_folder, f'IR_n_dhs_{base_file_name}.wav')
 
+    # Write IR to a temporary WAV file
     sf.write(output_file_path, ir_normalized, fs, format='wav', subtype='PCM_32')
-    print(f"Saved: {output_file_path}")
 
-    print("Processing complete. Job done!")
+    # Add scale factor metadata (make sure add_scalefactor_to_wav is imported)
+    add_scalefactor_to_wav(output_file_path, scalefactor_str, final)
+
+    # Verify that scalefactor is embedded
+    embedded_sf = get_scalefactor_from_wav(final)
+    print(f"Scalefactor from '{final}': {embedded_sf}")
+
+    print(f"{wav_file} => {final} (Processed)")
 
 ###########################################################################################################################
 
