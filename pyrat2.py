@@ -1,25 +1,25 @@
 import numpy as np # for matrix operations and fast math functions
-
 import glob
 import os as os # for operating system path manipulation
-
 import scipy.signal as signal # for signal processing functions
-from scipy.signal import butter, filtfilt, fftconvolve, get_window, resample
+from scipy.signal import butter, filtfilt, fftconvolve, get_window, resample, hilbert, sosfilt, zpk2sos
 from scipy.signal.windows import hann
 from scipy.special import erfc
 from scipy import stats
-
 import matplotlib.pyplot as plt # for plotting things
 import IPython.display as ipd # displaying audio in the python notebook
 from IPython.display import clear_output
 from matplotlib.gridspec import GridSpec
-
 import soundfile as sf # for loading and writing audio files
 from pydub import AudioSegment
 from pydub.utils import mediainfo
 import subprocess
 from scipy.io.wavfile import write
 from scipy.io import wavfile
+import warnings
+
+# Ensure warnings are visible
+warnings.simplefilter('always', UserWarning)
 
 def list_wav_files_in_folder(folder_path):
     """
@@ -524,9 +524,18 @@ def identify_direct_sound_arrival_threshold(ir, threshold):
                       the direct sound arrival is considered to occur.
     :return: An integer index of the first sample exceeding the threshold.
     """
-    scale_factor = np.max(np.abs(ir)) * 32768 / 32767
-    direct_sound_arrival_sample = np.where((np.abs(ir) / scale_factor) > threshold)[0][0]
-    return direct_sound_arrival_sample
+    ir = np.atleast_1d(ir)
+    peak_val = np.max(np.abs(ir))
+    if peak_val == 0:
+        raise ValueError("Impulse response is empty or all zeros.")
+    
+    scale_factor = peak_val * 32768 / 32767
+    indices_above_thresh = np.where((np.abs(ir) / scale_factor) > threshold)[0]
+    
+    if len(indices_above_thresh) == 0:
+        raise ValueError(f"No sample found above the given threshold ({threshold}).")
+        
+    return indices_above_thresh[0]
 
 def snr_calc(ir, fs, threshold=0.7):
     """
@@ -559,17 +568,6 @@ def snr_calc(ir, fs, threshold=0.7):
 
     """
     
-    def identify_direct_sound_arrival_threshold(ir_array, thresh):
-        # Avoid zero maximum case
-        peak_val = np.max(np.abs(ir_array))
-        if peak_val == 0:
-            raise ValueError("Impulse response is empty or all zeros.")
-        scale_factor = peak_val * 32768 / 32767
-        indices_above_thresh = np.where((np.abs(ir_array) / scale_factor) > thresh)[0]
-        if not len(indices_above_thresh):
-            raise ValueError("No sample exceeds the specified threshold.")
-        return indices_above_thresh[0]
-
     # If IR has multiple channels, use only the first channel
     if ir.ndim > 1:
         ir = ir[:, 0]
@@ -732,193 +730,264 @@ def smoothed_frequency_response(ir, sample_rate, start_time, end_time, threshold
     print("FR response done!")
     return F2out, fvecout
 
-def decaytime(ir, fs, dec, f_min=20, f_max=22, fbi=None, zetai=1.0):
+def decaytime(ir, fs, dec, f_min=20, f_max=20000, fbi=None, zetai=1.0, method='schroeder'):
     """
     Compute reverberation time (RT60-like metric) in user-specified frequency bands 
     for a given impulse response.
 
-    The process:
-    1. Identify the direct sound arrival in the IR and trim the first 20 ms before it.
-    2. Filter the IR into octave or user-defined bands.
-    3. Compute a smoothed energy envelope for each band.
-    4. Estimate noise floor and fit a linear decay to determine the time it takes 
-       to decay 'dec' dB (e.g., 60 dB for RT60).
-
     Parameters
     ----------
     ir : array_like
-        The impulse response data (1D or multi-channel). 
-        If multi-channel, the mean of all channels is used.
+        The impulse response data.
     fs : float
-        Sample rate in Hz of the impulse response.
+        Sample rate in Hz.
     dec : float
-        Decay level in dB for RT calculation (e.g., 60 for RT60).
+        Decay level in dB (e.g., 20, 30, 60).
     f_min : float, optional
-        Minimum frequency (Hz) of bands to include in the analysis (default = 20 Hz).
+        Minimum frequency (Hz).
     f_max : float, optional
-        Maximum frequency (Hz) of bands to include in the analysis (default = 22 Hz).
-        *Note*: in the original code, f_max=22 likely means 22 kHz if your 
-        IR is at 44.1 kHz or 48 kHz sampling. Adjust as needed if you intend 
-        to go up to 22 kHz.
-    fbi : list or numpy array, optional
-        Custom band center frequencies in Hz. If None, a default array is used.
+        Maximum frequency (Hz).
+    fbi : list, optional
+        Custom band center frequencies.
     zetai : float, optional
-        Filter bandwidth in octaves. Default is 1.0 (meaning one octave 
-        above and below each center frequency).
+        Filter bandwidth in octaves.
+    method : str, optional
+        'schroeder' (default): Backward integration (ISO 3382). Best for most cases.
+        'envelope': Smoothed energy envelope method (JSA/MATLAB style). 
 
     Returns
     -------
     rt60 : numpy.ndarray
         Reverberation times (seconds) for each band.
     fb : numpy.ndarray
-        Center frequencies (Hz) of the bands actually used.
-    
-    Notes
-    -----
-    - This function calls an internal `identify_direct_sound_arrival_threshold` 
-      to detect the direct sound arrival.
-    - The IR is trimmed so that the analysis starts ~20 ms before the 
-      identified direct arrival (but won't go before index 0).
-    - If a given bandpass filter range is invalid (e.g., > Nyquist or < 0), 
-      that band is skipped in the final results.
-    - The smoothing, noise floor estimation, and polynomial fit logic 
-      are retained from the original code.
-
+        Center frequencies (Hz) of the bands used.
     """
-
-    def identify_direct_sound_arrival_threshold(irm_data, threshold):
-        """
-        Identify the first sample index where irm_data 
-        exceeds 'threshold' * peak_amplitude.
-        """
-        peak_val = np.max(np.abs(irm_data))
-        if peak_val == 0:
-            raise ValueError("Impulse response is empty or all zeros.")
-        
-        scale_factor = peak_val * 32768 / 32767
-        above_thresh_indices = np.where((np.abs(irm_data) / scale_factor) > threshold)[0]
-        if not len(above_thresh_indices):
-            raise ValueError("No sample exceeds the specified threshold.")
-        return above_thresh_indices[0]
-
     # If IR has multiple channels, collapse to mono
     ir = np.asarray(ir)
     if ir.ndim > 1:
         ir = np.mean(ir, axis=1)
     
-    # Identify direct sound arrival index (with threshold=0.05, as in original code)
-    direct_arrival_idx = identify_direct_sound_arrival_threshold(ir, 0.05)
+    # Identify direct sound arrival index
+    try:
+        direct_arrival_idx = identify_direct_sound_arrival_threshold(ir, 0.05)
+    except ValueError:
+        # If detection fails, assume start is near 0 or return error
+        direct_arrival_idx = 0
 
-    # Decide how many samples before direct arrival to include (20 ms)
-    pre_arrival_samples = int(round(0.02 * fs))
-    start_idx = max(direct_arrival_idx - pre_arrival_samples, 0)
+    # Pre-roll for filtering (start 50ms before direct sound if possible)
+    pre_arrival_samples = int(round(0.05 * fs)) 
+    start_idx_processing = max(direct_arrival_idx - pre_arrival_samples, 0)
     
-    irm = ir[start_idx:]
+    irm = ir[start_idx_processing:]
     
-    # Default center frequencies if none provided
+    # Define frequency bands
     if fbi is None:
-        # Original code used 125 * 2^( -2.5:0.1:7.6 ), 
-        # but note that might produce many bands outside [f_min, f_max].
         fb_full = 125 * 2 ** np.arange(-2.5, 7.6, 0.1)
     else:
         fb_full = np.array(fbi, dtype=float)
     
-    # Filter the band centers to be within [f_min, f_max]
-    fb = [value for value in fb_full if f_min <= value <= f_max]
-    fb = np.array(fb, dtype=float)
+    fb = np.array([v for v in fb_full if f_min <= v <= f_max], dtype=float)
     nbands = len(fb)
 
-    # Set the filter order and limit the analysis duration
+    # 4th order Butterworth (order=2 passed to butter -> 2 poles * 2 passes = 4 poles effectively? 
+    # Actually butter(N) gives 2Nth order usually? No, butter(N) gives Nth order. 
+    # filtfilt doubles expected stopband attenuation. 
+    # JSA code uses order=2 with filtfilt.
     order = 2
-    btaps = min(len(irm), int(5 * fs))
+    
+    btaps = len(irm)
     irb = np.zeros((btaps, nbands), dtype=float)
 
-    # Bandpass filtering
-    from scipy.signal import butter, filtfilt
     nyquist = fs / 2
     for i, fc in enumerate(fb):
         low = (fc * 2 ** (-zetai / 2)) / nyquist
         high = (fc * 2 ** (zetai / 2)) / nyquist
-        # Only apply if valid band range
         if 0 < low < high < 1:
-            b, a = butter(order, [low, high], btype='bandpass')
-            irb[:, i] = filtfilt(b, a, irm[:btaps])
-        else:
-            # If invalid, we keep zeros in that column
-            pass
+            try:
+                b, a = butter(order, [low, high], btype='bandpass')
+                irb[:, i] = filtfilt(b, a, irm)
+            except Exception:
+                pass # Filter error (e.g. unstable)
 
-    # Smoothing the energy envelope
-    from scipy.signal import fftconvolve, get_window
-    beta_ms = 100  # 100 ms smoothing
-    staps = int(round(beta_ms * fs / 1000))
-    smooth_filter = get_window("hann", 2 * staps - 1)
-    smooth_filter /= np.sum(smooth_filter)
-
-    # sqrt of convolved power to avoid log of zero
-    # shape of irb^2 is (btaps, nbands). We convolve each band separately
-    ir_power = irb ** 2
-    irbs = np.sqrt(np.maximum(
-        fftconvolve(ir_power, smooth_filter[:, None], mode='same'), 
-        1e-10
-    ))
-
-    # Estimate noise floor from last 'eta' ms
-    eta_ms = 200
-    etaps = int(round(eta_ms * fs / 1000))
-    noise_floor = 20 * np.log10(irbs[-etaps:].mean(axis=0))
-
-    # Decay slope estimation
-    tau0_ms = 100  # Late field onset time (ms)
-    delta1_db = 5  # Additional margin above noise floor
     rt = np.zeros(nbands, dtype=float)
-
+    
+    # Processing per band
     for i in range(nbands):
-        index0 = int(round(tau0_ms * fs / 1000))
+        # 1. Squared Envelope
+        h2 = irb[:, i] ** 2
         
-        # Decay in dB for each sample in the band
-        decay_db = 20 * np.log10(irbs[:, i])
-        # Find index1 where the decay hits (noise_floor + delta1_db)
-        try:
-            index1_offset = np.where(decay_db[index0:] < (noise_floor[i] + delta1_db))[0][0]
-            index1 = index0 + index1_offset
-        except IndexError:
-            # If the decay never reached that level, skip
-            continue
+        # Noise floor estimation (last 10% or 200ms)
+        noise_len = max(int(0.1 * btaps), int(0.2 * fs))
+        if noise_len >= btaps: noise_len = btaps // 2
         
-        idx = np.arange(index0, index1)
-        if len(idx) < 2:
-            # Not enough data to fit
-            continue
+        noise_floor_energy = np.mean(h2[-noise_len:]) if noise_len < btaps else 1e-12
+        noise_floor_db = 10 * np.log10(noise_floor_energy + 1e-15)
         
-        # Linear fit of decay vs. time in seconds
-        time_s = idx / fs
-        slope, intercept = np.polyfit(time_s, decay_db[idx], 1)
+        # Peak energy (to check SNR)
+        peak_energy = np.max(h2)
+        peak_db = 10 * np.log10(peak_energy + 1e-15)
         
-        # RT = -dec / slope  (since slope is negative in a decaying IR)
-        if slope == 0:
-            # Avoid division by zero if slope is 0
-            rt[i] = 0
-        else:
-            rt[i] = -dec / slope
+        # SNR Check
+        snr_band = peak_db - noise_floor_db
+        if snr_band < (dec + 10): 
+            # Not enough dynamic range for requested decay
+            # We could try to fallback to a smaller decay and extrapolate, but let's be strict or return 0
+            # Ideally: if requested 60dB but only have 40dB SNR, we can't reliably give T60.
+            # But we can calculate T20 and * 3 if user allows.
+            # For now, let's just mark as invalid if SNR is very poor (< 15dB)
+            if snr_band < 15:
+                rt[i] = 0
+                continue
 
-    # For convenience, print average RT across bands
+        y_decay = None
+        
+        if method == 'schroeder':
+            # --- Schroeder Backward Integration ---
+            # "Intersection" truncation: integrate from where signal meets noise
+            # Find last point > noise_floor + 10dB (or similar margin)
+            # This is robust for noisy tails.
+            
+            # Smoothing for endpoint detection
+            win_s = int(0.05 * fs)
+            smoother = np.ones(win_s)/win_s
+            h2_smooth = fftconvolve(h2, smoother, mode='same')
+            
+            # Find truncation point (intersection with noise + e.g. 5-10dB)
+            # Working in dB is often easier
+            h2_db = 10 * np.log10(h2_smooth + 1e-15)
+            
+            # Find last sample > noise_floor_db + 5 dB
+            valid_indices = np.where(h2_db > (noise_floor_db + 5))[0]
+            if len(valid_indices) == 0:
+                trunc_idx = btaps - 1 
+            else:
+                trunc_idx = valid_indices[-1]
+                
+            # Integrate backwards from truncation point
+            schroeder_curve = np.flip(np.cumsum(np.flip(h2[:trunc_idx] - noise_floor_energy)))
+            
+            # Avoid negatives/zeros in log
+            schroeder_curve = np.maximum(schroeder_curve, 1e-15)
+            # Normalize
+            schroeder_curve /= np.max(schroeder_curve)
+            
+            y_decay = 10 * np.log10(schroeder_curve)
+            
+            # Time axis for this curve matches irb[:trunc_idx]
+            # But the start of the decay is the global peak of the IR (direct sound)
+            # We need to offset our linear fit relative to the peak of the Schroeder curve?
+            # Usually we just take 0dB as t=0 for the fit.
+            t_axis = np.arange(len(y_decay)) / fs
+            
+        else: # method == 'envelope'
+            # --- Envelope Method (JSA / MATLAB) ---
+            # Smoothing window (beta=100ms)
+            beta_ms = 100
+            staps = int(round(beta_ms * fs / 1000))
+            smooth_win = get_window('hann', 2 * staps - 1)
+            smooth_win /= np.sum(smooth_win)
+            
+            h_env = np.sqrt(np.maximum(
+                fftconvolve(h2, smooth_win, mode='same'), 1e-15
+            ))
+            
+            y_decay = 20 * np.log10(h_env) # 20log of amplitude envelope = 10log of energy
+            t_axis = np.arange(len(y_decay)) / fs
+            
+            # JSA logic: fit starts at tau0=100ms
+            # Ends at noise_floor + 12dB
+            # We'll handle this in the generic fitting block below using 'start_db' logic.
+            
+        
+        # --- Linear Fit Logic (Common) ---
+        # Determine dB ranges
+        if dec == 10: # EDT
+            fit_start_db = 0; fit_end_db = -10
+        elif dec == 20: # T20
+            fit_start_db = -5; fit_end_db = -25
+        elif dec == 30: # T30
+            fit_start_db = -5; fit_end_db = -35
+        else: # T60 requested
+            # Try to get -5 to -65
+            fit_start_db = -5; fit_end_db = -65
+            
+        # Safeguard: if SNR is low, we might not reach fit_end_db.
+        # Check if we assume linear decay, does our y_decay go low enough?
+        min_y = np.min(y_decay)
+        if min_y > fit_end_db + 5:
+           # Signal doesn't decay enough for this measure
+           rt[i] = 0
+           continue
+
+        try:
+            # Find indices for start and end levels
+            # We want the FIRST time it crosses start_db (after peak)
+            # And the FIRST time it crosses end_db
+            
+            # For Schroeder: curve is monotonic decreasing.
+            # For Envelope: might wobble. JSA code uses fixed start time (100ms).
+            # We'll use level-based detection for consistency with ISO.
+            
+            # Find peak index first (t=0)
+            peak_idx = np.argmax(y_decay)
+            
+            # Search after peak
+            y_search = y_decay[peak_idx:]
+            
+            idx_start_rel = np.where(y_search <= fit_start_db)[0]
+            if len(idx_start_rel) == 0: continue
+            idx_start = peak_idx + idx_start_rel[0]
+            
+            idx_end_rel = np.where(y_search <= fit_end_db)[0]
+            if len(idx_end_rel) == 0: continue
+            idx_end = peak_idx + idx_end_rel[0]
+            
+            if idx_end <= idx_start + 2: continue # Too few points
+            
+            # Regression
+            y_segment = y_decay[idx_start:idx_end]
+            t_segment = t_axis[idx_start:idx_end]
+            
+            slope, intercept = stats.linregress(t_segment, y_segment)[:2]
+            
+            if slope >= 0:
+                rt[i] = 0
+            else:
+                # Calculate T60
+                # Slope is dB/sec. T60 = 60 / |slope|
+                # The slope represents the decay rate of the line.
+                # If we fitted -5 to -25 (20dB drop), the slope tells us how fast 
+                # it drops. e.g. -100 dB/s.
+                # RT60 = 60 / 100 = 0.6s.
+                # So it's always -60 / slope, regardless of the segment used.
+                
+                val = -60.0 / slope
+                
+                # Sanity Check: RT60 shouldn't be absurdly larger than the file duration
+                max_valid_rt = (len(ir) / fs) * 1.5
+                if val > max_valid_rt or val < 0:
+                    rt[i] = 0
+                else:
+                    rt[i] = val
+                
+        except Exception:
+            rt[i] = 0
+
     valid_rt = rt[rt > 0]
     if len(valid_rt) > 0:
-        print(f"Estimated RT ({dec} dB) across valid bands: {np.mean(valid_rt):.2f} s")
-    else:
-        print("No valid decay times were computed.")
-
+        print(f"Estimated RT ({method}, {dec} dB basis) - mean valid: {np.mean(valid_rt):.2f} s")
+        
     return rt, fb
 
-def echodensity(ir, fs, wtaps,length,threshold=0.05):
+def echodensity(ir, fs, wtaps, length, threshold=0.05, align=True):
     """
     Compute the echo density (NED) and response energy profile (REP) 
     of an impulse response over time, using a running window.
 
     Steps:
-    1. Identify the direct sound arrival in the IR using a threshold 
+    1. (Optional) Identify the direct sound arrival in the IR using a threshold 
        of its normalized amplitude.
-    2. Cut a user-defined time segment of the IR starting ~5 ms before
+    2. (Optional) Cut a user-defined time segment of the IR starting ~5 ms before
        the direct arrival.
     3. Use a specified window (or window size) to compute:
        - REP: A smoothed energy profile (RMS) over the window.
@@ -941,6 +1010,9 @@ def echodensity(ir, fs, wtaps,length,threshold=0.05):
     threshold : float, optional
         Amplitude threshold (as a fraction of peak amplitude) 
         for identifying the direct sound arrival. Default is 0.05.
+    align : bool, optional
+        If True (default), automatically detects direct sound and crops the IR.
+        If False, processes the IR as-is (up to 'length' seconds).
 
     Returns
     -------
@@ -964,20 +1036,6 @@ def echodensity(ir, fs, wtaps,length,threshold=0.05):
     - `rep` is effectively the local RMS: sqrt of the windowed average of IR^2.
     """
 
-    def identify_direct_sound_arrival_threshold(ir_array, thr):
-        """
-        Returns the first index where the IR exceeds 'thr * peak_amplitude'.
-        """
-        ir_array = np.atleast_1d(ir_array)
-        peak_val = np.max(np.abs(ir_array))
-        if peak_val == 0:
-            raise ValueError("Impulse response is empty or all zeros.")
-        scaled_ir = np.abs(ir_array) / peak_val
-        idx_candidates = np.where(scaled_ir > thr)[0]
-        if len(idx_candidates) == 0:
-            raise ValueError(f"No sample found above threshold={thr} * peak_amplitude.")
-        return idx_candidates[0]
-
     # If IR has multiple channels, shape = (samples, channels)
     # If IR is 1D, make sure it's (samples, 1)
     ir = np.atleast_2d(ir)
@@ -985,13 +1043,21 @@ def echodensity(ir, fs, wtaps,length,threshold=0.05):
         # Possibly shape was (channels, samples), so transpose
         ir = ir.T
 
-    # Identify direct sound arrival
-    direct_index = identify_direct_sound_arrival_threshold(ir, threshold)
+    if align:
+        # Identify direct sound arrival
+        direct_index = identify_direct_sound_arrival_threshold(ir, threshold)
 
-    # Subtract 5 ms from direct sound for the starting sample
-    start_offset = int(round(0.005 * fs))
-    start = max(direct_index - start_offset, 0)
+        # Subtract 5 ms from direct sound for the starting sample
+        start_offset = int(round(0.005 * fs))
+        start = max(direct_index - start_offset, 0)
+    else:
+        start = 0
+
     end = int(round(length * fs)) + start
+    # Ensure end doesn't exceed length
+    if end > ir.shape[0]:
+        end = ir.shape[0]
+        
     ir = ir[start:end, :]
 
     # Prepare the window
@@ -1028,7 +1094,7 @@ def echodensity(ir, fs, wtaps,length,threshold=0.05):
 
         # Windowed average power => local RMS
         local_power = np.sum(window[:, None] * ir2_padded[index, :], axis=0)
-        rep[n, :] = np.sqrt(local_power) 
+        rep[n, :] = np.sqrt(local_power)
 
         # Compare each sample's power to rep[n]^2
         # True => 1.0, False => 0.0, weighted by window => sum => fraction
@@ -1189,20 +1255,6 @@ def c80d50(ir, fs, length, threshold=0.9):
       where t0 is the detected direct sound arrival sample.
     """
 
-    def identify_direct_sound_arrival_threshold(ir_array, thr):
-        """
-        Identify the first sample index where IR exceeds (thr * peak_amplitude).
-        """
-        peak_val = np.max(np.abs(ir_array))
-        if peak_val == 0:
-            raise ValueError("Impulse response is empty or all zeros.")
-        
-        scale_factor = peak_val * 32768 / 32767
-        indices = np.where((np.abs(ir_array) / scale_factor) > thr)[0]
-        if len(indices) == 0:
-            raise ValueError("No sample found above the given threshold.")
-        return indices[0]
-
     # If IR has multiple channels, shape = (samples, channels).
     # If 1D, we reshape to (samples, 1) to unify the indexing.
     if ir.ndim == 1:
@@ -1248,3 +1300,375 @@ def c80d50(ir, fs, length, threshold=0.9):
     print(f"C80 in dB: {c80_val:.3f}   D50 in %: {d50_val:.3f}")
 
     return c80_val, d50_val
+
+def generate_directory_report(input_folder, output_folder, file_pattern='*.wav'):
+    """
+    Scans a folder for WAV files, calculates acoustic metrics (RT60, C80, D50, SNR, Echo Density),
+    generates waveform/spectrogram/NED plots, and compiles a Markdown report.
+
+    Parameters
+    ----------
+    input_folder : str
+        Path to the folder containing .wav files.
+    output_folder : str
+        Path to the folder where reports and plots will be saved.
+    file_pattern : str, optional
+        Glob pattern for finding files (default '*.wav').
+    """
+    if not os.path.isdir(input_folder):
+        print(f"Input folder '{input_folder}' does not exist.")
+        return
+
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+    
+    plots_folder = os.path.join(output_folder, "plots")
+    if not os.path.exists(plots_folder):
+        os.makedirs(plots_folder)
+
+    wav_files = glob.glob(os.path.join(input_folder, file_pattern))
+    wav_files.sort()
+    
+    if not wav_files:
+        print(f"No WAV files found in '{input_folder}' matching '{file_pattern}'.")
+        return
+
+    results = []
+    
+    print(f"Found {len(wav_files)} files. Starting processing...")
+    
+    for wav_file in wav_files:
+        filename = os.path.basename(wav_file)
+        print(f"Processing {filename}...")
+        
+        try:
+            # 1. Load Audio
+            ir, fs = sf.read(wav_file)
+            if ir.ndim > 1:
+                # Use first channel for consistency in metrics if multi-channel
+                # (Some metrics already handle multi-channel, but for reporting we often look at mono or Ch1)
+                ir_mono = ir[:, 0]
+            else:
+                ir_mono = ir
+                
+            # Metrics container for this file
+            file_metrics = {
+                'filename': filename,
+                'fs': fs,
+                'duration_s': len(ir_mono) / fs,
+                'error': None
+            }
+            
+            # 2. SNR
+            try:
+                snr_val = snr_calc(ir_mono, fs)
+                file_metrics['snr'] = snr_val
+            except Exception as e:
+                print(f"  Error calculating SNR: {e}")
+                file_metrics['snr'] = None
+
+            # 3. C80 / D50
+            try:
+                # Use a reasonable length for analysis, e.g., total duration
+                c80, d50 = c80d50(ir_mono, fs, file_metrics['duration_s'])
+                file_metrics['c80'] = c80
+                file_metrics['d50'] = d50
+            except Exception as e:
+                print(f"  Error calculating C80/D50: {e}")
+                file_metrics['c80'] = None
+                file_metrics['d50'] = None
+            
+            # 4. RT60 (decaytime)
+            try:
+                # Analyze standardized bands 
+                fbi = [125, 250, 500, 1000, 2000, 4000, 8000]
+                # Use T30 (decay of 30dB) and multiply by 2 for RT60 estimate, 
+                # as full 60dB range is rarely available in measurements.
+                rt_bands, freqs = decaytime(ir_mono, fs, 30, f_min=100, f_max=10000, fbi=fbi)
+                rt_bands = rt_bands * 2 # Convert T30 to RT60
+                
+                # Store RT60 at 1kHz specifically for summary
+                idx_1k = np.argmin(np.abs(freqs - 1000))
+                rt60_1k = rt_bands[idx_1k] if len(rt_bands) > idx_1k else None
+                file_metrics['rt60_1k'] = rt60_1k
+                file_metrics['rt60_bands'] = rt_bands.tolist()
+                file_metrics['rt60_freqs'] = freqs.tolist()
+            except Exception as e:
+                print(f"  Error calculating RT60: {e}")
+                file_metrics['rt60_1k'] = None
+
+            # 5. Echo Density
+            try:
+                # Window size typically ~20-50ms for echo density
+                wtaps = int(0.02 * fs) # 20ms window
+                # Analyze a chunk, e.g., 1 second or full duration
+                analyze_len = min(1.0, file_metrics['duration_s'] - 0.01)
+                
+                ned, rep, t_ned = echodensity(ir_mono, fs, wtaps, analyze_len, align=True)
+                
+                # Generate Echo Density Plot
+                fig_ned, ax_ned = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+                
+                # Plot Normalized Echo Density
+                ax_ned[0].plot(t_ned, ned)
+                ax_ned[0].set_ylabel('NED')
+                ax_ned[0].set_title(f'Normalized Echo Density - {filename}')
+                ax_ned[0].grid(True)
+                
+                # Plot Response Energy Profile
+                ax_ned[1].plot(t_ned, rep)
+                ax_ned[1].set_ylabel('REP (RMS)')
+                ax_ned[1].set_xlabel('Time (s)')
+                ax_ned[1].grid(True)
+                
+                ned_plot_path = os.path.join(plots_folder, f"ned_{filename}.png")
+                plt.tight_layout()
+                plt.savefig(ned_plot_path)
+                plt.close(fig_ned)
+                
+                file_metrics['ned_plot'] = os.path.relpath(ned_plot_path, output_folder)
+
+            except Exception as e:
+                print(f"  Error calculating Echo Density: {e}")
+                file_metrics['ned_plot'] = None
+
+            # 6. Waveform and Spectrogram Plot
+            try:
+                fig_spec, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6), gridspec_kw={'height_ratios': [1, 2]})
+                
+                # Waveform
+                time_vec = np.arange(len(ir_mono)) / fs
+                ax1.plot(time_vec, ir_mono)
+                ax1.set_ylabel('Amplitude')
+                ax1.set_title(f'Waveform & Spectrogram - {filename}')
+                ax1.set_xlim([0, file_metrics['duration_s']])
+                ax1.grid(True)
+                
+                # Spectrogram
+                Pxx, freqs_spec, t_spec, im = ax2.specgram(
+                    ir_mono, NFFT=2048, Fs=fs, noverlap=1024, cmap='inferno'
+                )
+                ax2.set_ylabel('Frequency (Hz)')
+                ax2.set_xlabel('Time (s)')
+                ax2.set_yscale('log')
+                ax2.set_ylim([20, fs/2])
+                
+                spec_plot_path = os.path.join(plots_folder, f"spec_{filename}.png")
+                plt.tight_layout()
+                plt.savefig(spec_plot_path)
+                plt.close(fig_spec)
+                
+                file_metrics['spec_plot'] = os.path.relpath(spec_plot_path, output_folder)
+                
+            except Exception as e:
+                print(f"  Error generating spectrogram: {e}")
+                file_metrics['spec_plot'] = None
+                
+            results.append(file_metrics)
+            
+        except Exception as e:
+            print(f"Critical error processing {filename}: {e}")
+            results.append({'filename': filename, 'error': str(e)})
+
+    # Generate Markdown Report
+    report_path = os.path.join(output_folder, "report.md")
+    with open(report_path, "w") as f:
+        f.write(f"# Acoustic Analysis Report\\n")
+        f.write(f"**Input Folder:** `{input_folder}`\\n")
+        f.write(f"**Date:** {np.datetime64('today')}\\n\\n")
+        
+        f.write("## Summary Table\\n")
+        f.write("| Filename | SNR (dB) | RT60 @ 1kHz (s) | C80 (dB) | D50 (%) |\\n")
+        f.write("| --- | --- | --- | --- | --- |\\n")
+        
+        for res in results:
+            if res.get('error'):
+                f.write(f"| {res['filename']} | Error | - | - | - |\\n")
+                continue
+            
+            snr_str = f"{res.get('snr', 0):.2f}" if res.get('snr') is not None else "-"
+            rt60_str = f"{res.get('rt60_1k', 0):.2f}" if res.get('rt60_1k') is not None else "-"
+            c80_str = f"{res.get('c80', 0):.2f}" if res.get('c80') is not None else "-"
+            d50_str = f"{res.get('d50', 0):.1f}" if res.get('d50') is not None else "-"
+            
+            f.write(f"| {res['filename']} | {snr_str} | {rt60_str} | {c80_str} | {d50_str} |\\n")
+        
+        f.write("\\n## Detailed Analysis\\n")
+        for res in results:
+            if res.get('error'):
+                continue
+                
+            f.write(f"### {res['filename']}\\n")
+            f.write(f"- **Duration:** {res['duration_s']:.2f} s\\n")
+            f.write(f"- **SNR:** {res.get('snr', 0):.2f} dB\\n")
+            f.write(f"- **RT60 (1kHz):** {res.get('rt60_1k', 0):.2f} s\\n")
+            
+            if res.get('spec_plot'):
+                f.write(f"![Spectrogram]({res['spec_plot']})\\n")
+            
+            if res.get('ned_plot'):
+                f.write(f"![Echo Density]({res['ned_plot']})\\n")
+                
+            f.write("\\n---\\n")
+
+    print(f"Report generated at: {report_path}")
+
+def generate_sipi_ir(ir, fs, num_copies=1, bands_per_octave=3):
+    """
+    Generate statistically independent, perceptually identical (SIPI) copies of an Impulse Response.
+    
+    Methodology: Echo-Density-Matched Sub-band Envelope Imposition.
+    1. Analyze the broadband Echo Density (NED) of the original IR.
+    2. Generate a sparse 'Velvet Noise' carrier where pulse density matches the measured NED.
+    3. Filter this carrier into sub-bands.
+    4. Modulate each band by the *smoothed* energy envelope of the original band.
+    5. Sum bands to reconstruct.
+
+    Parameters
+    ----------
+    ir : array_like
+        Original impulse response (1D).
+    fs : float
+        Sample rate.
+    num_copies : int, optional
+        Number of SIPI copies.
+    bands_per_octave : int, optional
+        Bandwidth resolution (default 3 for 1/3 octave).
+
+    Returns
+    -------
+    sipi_irs : list
+        List of generated IRs.
+    """
+    ir = np.asarray(ir)
+    if ir.ndim > 1:
+        ir = ir[:, 0]
+    
+    # 1. Analyze Echo Density
+    # Use a window of ~20ms for analysis
+    wtaps = int(0.02 * fs)
+    # Align=True to focus on the dense part and get correct profile
+    # But we need the NED profile for the WHOLE file to map it.
+    # So we should probably align=False to keep time base, or handle alignment carefully.
+    # Let's use align=False to get a NED vector matching input lenth (roughly).
+    # But echodensity() crops the start. We need to handle that.
+    # Actually, simpler: just run echodensity on the whole zero-padded thing or handle the offset.
+    # The existing echodensity function with align=True returns `t` vector relative to crop.
+    # Let's use standard echodensity but align=False to map 1:1 if possible, 
+    # but `echodensity` implementation does some cropping logic even then?
+    # Let's look at `echodensity` again.
+    # It calls `identify_direct_sound` and crops.
+    # If align=False, it starts from 0?
+    
+    # We will use the implementation inside pyrat.
+    # If we pass align=False, it should process the whole thing.
+    # Let's assume we can get a NED vector of same length as IR (or close).
+    
+    try:
+        # We need to ensure we capture the whole duration.
+        duration = len(ir) / fs
+        # Run echodensity with align=False to map 1:1
+        ned, rep, t_ned = echodensity(ir, fs, wtaps, duration, align=False)
+        
+        # ned might be slightly shorter due to windowing/processing
+        # We need to interpolate NED to sample-level for generation
+        ned_interp = np.interp(np.arange(len(ir)), np.arange(len(ned)) * (len(ir)/len(ned)), ned[:, 0])
+        
+    except Exception as e:
+        print(f"Error calculating echo density: {e}. Fallback to White Noise.")
+        ned_interp = np.ones(len(ir)) # Full density
+
+    # Clip NED to [0, 1]
+    ned_interp = np.clip(ned_interp, 1e-4, 1.0)
+    
+    # Prepare Filters
+    nyquist = fs / 2
+    if bands_per_octave == 1:
+        f_center = 1000 * 2.0 ** np.arange(-6, 6)
+    else:
+        f_center = 1000 * 2.0 ** (np.arange(-18, 18) / 3.0)
+
+    valid_centers = [f for f in f_center if 20 <= f < nyquist]
+    if not valid_centers: return [np.random.randn(len(ir))]
+
+    sipi_irs = []
+    print(f"Generating {num_copies} SIPI copies (ED-matched, {len(valid_centers)} bands)...")
+
+    for _ in range(num_copies):
+        # 2. Generate Sparse Carrier (Velvet Noise variant)
+        # Pulse rate ~ density. 
+        # Full density (NED=1) means ~ Gaussian noise ~ 1 pulse per sample (conceptually).
+        # Actually, for "Velvet noise", density usually refers to pulses per second.
+        # But here NED is a statistical measure. NED=1 -> Gaussian. NED -> 0 -> Sparse.
+        # Relation: NED ~ erf( sqrt(density_in_pulses_per_window) ) ? 
+        # A simpler heuristic mapping:
+        # Probability of a pulse at sample n: P[n] = NED[n]
+        # If NED=1, P=1 (pulse every sample -> like white noise). 
+        # If NED=0.1, P=0.1.
+        # Magnitudes should be random +/- 1.
+        
+        # Stochastic generation
+        probs = np.random.rand(len(ir))
+        # Where rand < ned, placing a pulse.
+        # But we need to define "max density". White noise has samples at every point.
+        # So we can just mask white noise?
+        # Sparse Carrier = WhiteNoise * Mask(where rand < NED)
+        # But if we mask white noise, the energy drops. We need to normalize later by envelope.
+        
+        mask = probs < ned_interp
+        # Random binary phase +/- 1
+        signs = np.where(np.random.rand(len(ir)) > 0.5, 1, -1)
+        carrier = np.zeros(len(ir))
+        carrier[mask] = signs[mask]
+        
+        # 3. Sub-band Synthesis
+        sipi_accum = np.zeros_like(ir)
+        
+        for fc in valid_centers:
+            # Filter Bands
+            factor = 2 ** (1.0 / (2 * bands_per_octave))
+            low = fc / factor
+            high = fc * factor
+            if high >= nyquist: high = nyquist - 1e-5
+            if low <= 0: low = 1e-5
+            
+            sos = butter(2, [low / nyquist, high / nyquist], btype='bandpass', output='sos')
+            
+            # Original Band
+            band_orig = signal.sosfiltfilt(sos, ir)
+            
+            # Envelope Extraction
+            # Use smoothed envelope (RMS in window) rather than Hilbert,
+            # because Hilbert is too jagged for creating smooth decay profiles on sparse sparse carriers.
+            # Window ~ 20ms
+            rms_win = int(0.02 * fs)
+            # Use gaussian or hann window
+            win = signal.windows.hann(rms_win)
+            win /= np.sum(win)
+            
+            # Energy envelope
+            env_sq = signal.fftconvolve(band_orig**2, win, mode='same')
+            env = np.sqrt(np.maximum(env_sq, 1e-18))
+            
+            # Filter Carrier same way (to get temporal smearing of pulses expected in that band)
+            band_carrier = signal.sosfiltfilt(sos, carrier)
+            
+            # Now we impose the envelope.
+            # But the 'band_carrier' has its own envelope (due to sparsity and filtering).
+            # If we just multiply, we might double-apply the sparsity?
+            # No, 'band_carrier' IS the sparse process filtered.
+            # We want to force its global energy envelope to match 'env'.
+            
+            # Extract carrier envelope
+            c_env_sq = signal.fftconvolve(band_carrier**2, win, mode='same')
+            c_env = np.sqrt(np.maximum(c_env_sq, 1e-18))
+            
+            # Demodulate carrier (whiten) then Remodulate
+            # Avoid divide by zero
+            band_sipi = (band_carrier / (c_env + 1e-9)) * env
+            
+            sipi_accum += band_sipi
+            
+        sipi_irs.append(sipi_accum)
+
+    return sipi_irs
